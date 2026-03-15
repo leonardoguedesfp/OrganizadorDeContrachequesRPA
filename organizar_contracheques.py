@@ -583,6 +583,115 @@ def gerar_planilha_p300(pasta_entrada: str, callback_log=None):
     # Cabeçalho fixo
     ws.freeze_panes = "A2"
 
+    # ------------------------------------------------------------------
+    # Aba 2: Consolidado por Competência
+    # ------------------------------------------------------------------
+    from collections import defaultdict
+
+    # Agrupar por competência a partir dos dados já extraídos
+    agrupado: dict[str, list[float]] = defaultdict(list)
+    for oc in todas_ocorrencias:
+        agrupado[oc['competencia']].append(oc['valor'])
+
+    # Ordenar competências cronologicamente (converter temporariamente para
+    # comparação, mas manter como string para exibição)
+    competencias_ordenadas = sorted(
+        agrupado.keys(),
+        key=_chave_ordenacao_mes_ano,
+    )
+
+    ws2 = wb.create_sheet(title="Consolidado por Competência")
+
+    # Estilos específicos da aba 2
+    fill_negativo = PatternFill(
+        start_color="FFE0E0", end_color="FFE0E0", fill_type="solid",
+    )
+
+    # Cabeçalho
+    colunas2 = ["Competência", "Qtd. Lançamentos", "Valor Resultante (R$)"]
+    ws2.row_dimensions[1].height = 22
+    for col_idx, titulo in enumerate(colunas2, 1):
+        cell = ws2.cell(row=1, column=col_idx, value=titulo)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = borda
+
+    # Dados
+    for row_idx, comp in enumerate(competencias_ordenadas, 2):
+        lancamentos = agrupado[comp]
+        soma = round(sum(lancamentos), 2)
+        qtd = len(lancamentos)
+
+        # Fundo: negativo → vermelho claro, senão alternância branco/azul
+        if soma < 0:
+            fill = fill_negativo
+        elif (row_idx % 2) == 0:
+            fill = fill_branco
+        else:
+            fill = fill_azul
+
+        # Coluna A: Competência
+        cell = ws2.cell(row=row_idx, column=1, value=comp)
+        cell.font = data_font
+        cell.alignment = align_center
+        cell.border = borda
+        cell.fill = fill
+
+        # Coluna B: Qtd. Lançamentos
+        cell = ws2.cell(row=row_idx, column=2, value=qtd)
+        cell.font = data_font
+        cell.alignment = align_center
+        cell.border = borda
+        cell.fill = fill
+
+        # Coluna C: Valor Resultante (R$)
+        cell = ws2.cell(row=row_idx, column=3, value=soma)
+        cell.number_format = '#,##0.00'
+        cell.font = data_font
+        cell.alignment = align_right
+        cell.border = borda
+        cell.fill = fill
+
+    # Linha de totais
+    total_row = len(competencias_ordenadas) + 2
+    total_competencias = len(competencias_ordenadas)
+    soma_geral = round(sum(
+        sum(agrupado[c]) for c in competencias_ordenadas
+    ), 2)
+
+    total_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+
+    cell = ws2.cell(row=total_row, column=1, value=f"Total ({total_competencias})")
+    cell.font = total_font
+    cell.fill = header_fill
+    cell.alignment = align_center
+    cell.border = borda
+
+    cell = ws2.cell(
+        row=total_row, column=2,
+        value=sum(len(agrupado[c]) for c in competencias_ordenadas),
+    )
+    cell.font = total_font
+    cell.fill = header_fill
+    cell.alignment = align_center
+    cell.border = borda
+
+    cell = ws2.cell(row=total_row, column=3, value=soma_geral)
+    cell.number_format = '#,##0.00'
+    cell.font = total_font
+    cell.fill = header_fill
+    cell.alignment = align_right
+    cell.border = borda
+
+    # Larguras
+    ws2.column_dimensions['A'].width = 18
+    ws2.column_dimensions['B'].width = 22
+    ws2.column_dimensions['C'].width = 24
+
+    # Cabeçalho fixo
+    ws2.freeze_panes = "A2"
+
     nome_arquivo = f"P300_{nome_cliente}.xlsx"
     caminho_saida = os.path.join(pasta_entrada, nome_arquivo)
     wb.save(caminho_saida)
@@ -591,7 +700,9 @@ def gerar_planilha_p300(pasta_entrada: str, callback_log=None):
     resumo = (
         f"\nPlanilha P300 gerada com sucesso!\n"
         f"  Arquivo: {nome_arquivo}\n"
-        f"  Ocorrências de P300: {len(todas_ocorrencias)}\n"
+        f"  Aba 1 - Ocorrências P300: {len(todas_ocorrencias)} linhas\n"
+        f"  Aba 2 - Consolidado por Competência: "
+        f"{total_competencias} competências\n"
         f"  Estornos: {total_estornos}\n"
         f"  Arquivos sem P300: {arquivos_sem_p300}"
     )
