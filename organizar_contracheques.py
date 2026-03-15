@@ -63,37 +63,55 @@ PADRAO_COMPETENCIA = re.compile(
     re.IGNORECASE,
 )
 
-# Padrão para identificar célula que contém a verba P300
-PADRAO_CELULA_P300 = re.compile(r'^P\s*\.?\s*300$', re.IGNORECASE)
+# Padrão para valores monetários brasileiros (ex: 1.234,56 ou 1234,56 ou 7.339,36-)
+PADRAO_VALOR_BR = re.compile(
+    r'^(\d{1,3}(?:\.\d{3})*,\d{2})\s*(-)?$'
+)
 
-# Padrão para identificar valores monetários (ex: 1.234,56 ou 1234,56 ou 1234.56)
-PADRAO_VALOR_MONETARIO = re.compile(r'^-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})$')
+# Padrão para identificar "Mês / Ano" no cabeçalho da página (campo de referência)
+PADRAO_MES_ANO_CABECALHO = re.compile(
+    r'[Mm][eê]s\s*/?\s*[Aa]no\s*[:\s]*(\d{1,2}\s*/\s*\d{4})',
+)
 
-# Padrão para datas em células de tabela (MM/AAAA ou MM.AAAA ou MM-AAAA)
-PADRAO_DATA_CELULA = re.compile(r'(\d{1,2})\s*[/.\-]\s*(2\d{3})')
+# Padrão para capturar competência em célula de tabela (MM/AAAA)
+PADRAO_COMPETENCIA_CELULA = re.compile(r'(\d{1,2}/\d{4})')
 
 
 def _parse_valor_br(texto: str) -> float | None:
-    """Converte valor monetário brasileiro (1.234,56) para float."""
+    """
+    Converte valor monetário brasileiro para float.
+    Formato: ponto como milhar, vírgula como decimal.
+    Sinal negativo pode estar no final (ex: 7.339,36-).
+    Retorna None se não for um valor válido.
+    """
     if not texto:
         return None
-    texto = texto.strip().lstrip('-').strip()
-    match = PADRAO_VALOR_MONETARIO.match(texto.strip())
+    texto = texto.strip()
+    # Detectar sinal negativo (início ou final)
+    negativo = False
+    if texto.startswith('-'):
+        negativo = True
+        texto = texto[1:].strip()
+    if texto.endswith('-'):
+        negativo = True
+        texto = texto[:-1].strip()
+    match = PADRAO_VALOR_BR.match(texto)
     if match:
+        if match.group(2) == '-':
+            negativo = True
         valor_str = match.group(1).replace('.', '').replace(',', '.')
         try:
-            return float(valor_str)
+            val = float(valor_str)
+            return -val if negativo else val
         except ValueError:
             return None
-    # Fallback: tentar interpretar diretamente se for algo simples como "1234,56"
-    texto_limpo = texto.strip().replace('.', '').replace(',', '.')
+    # Fallback: tentar interpretar diretamente (ex: "1234,56")
+    texto_limpo = texto.replace('.', '').replace(',', '.')
     try:
         val = float(texto_limpo)
-        if val > 0:
-            return val
+        return -val if negativo else val
     except ValueError:
-        pass
-    return None
+        return None
 
 
 def extrair_data_contracheque(caminho_pdf: str) -> datetime | None:
@@ -142,108 +160,172 @@ def _encontrar_indice_coluna(cabecalho: list[str | None], *nomes) -> int | None:
     return None
 
 
-def _extrair_p300_da_tabela(tabela: list[list], data_pdf: datetime | None):
+def _extrair_mes_ano_pagina(texto_pagina: str) -> str | None:
     """
-    Dada uma tabela extraída do PDF (lista de linhas, cada linha é lista de
-    células), encontra as linhas com verba P300 e extrai data + valor.
-    Retorna lista de (datetime | None, float).
+    Extrai o campo "Mês / Ano" do cabeçalho de uma página de contracheque.
+    Retorna como string no formato MM/AAAA. Não converte para datetime.
     """
-    if not tabela or len(tabela) < 2:
-        return []
+    # Prioridade 1: campo "Mês / Ano" explícito
+    match = PADRAO_MES_ANO_CABECALHO.search(texto_pagina)
+    if match:
+        raw = match.group(1).replace(' ', '')
+        parts = raw.split('/')
+        if len(parts) == 2:
+            return f"{int(parts[0]):02d}/{parts[1]}"
 
-    # Tentar identificar cabeçalho (primeira linha)
-    cabecalho = tabela[0]
+    # Prioridade 2: Competência/Referência no cabeçalho
+    match = PADRAO_COMPETENCIA.search(texto_pagina)
+    if match:
+        mes, ano = match.group(1), match.group(2)
+        return f"{int(mes):02d}/{ano}"
 
-    # Procurar colunas relevantes
-    idx_verba = _encontrar_indice_coluna(cabecalho, 'verba', 'rubrica', 'código', 'codigo', 'cod')
-    idx_valor = _encontrar_indice_coluna(cabecalho, 'valor', 'vencimento', 'provento', 'total')
-    idx_desc = _encontrar_indice_coluna(cabecalho, 'descrição', 'descricao', 'denominação', 'denominacao', 'nome')
+    # Prioridade 3: primeiro padrão MM/AAAA encontrado
+    for match in PADRAO_MES_ANO.finditer(texto_pagina):
+        mes, ano = int(match.group(1)), int(match.group(2))
+        if 1 <= mes <= 12 and 2000 <= ano <= 2099:
+            return f"{mes:02d}/{ano}"
 
+    return None
+
+
+def _extrair_p300_pagina(page, mes_ano_pagina: str | None):
+    """
+    Extrai todas as ocorrências de P300 de uma página de PDF.
+    Retorna lista de dicts: {contracheque, competencia, valor}
+    - contracheque: string MM/AAAA do cabeçalho da página
+    - competencia: string MM/AAAA da coluna Competência da linha P300
+    - valor: float (negativo se estorno)
+    """
     resultados = []
 
-    for linha in tabela[1:]:
-        if not linha:
-            continue
+    # Tentar extração por tabelas primeiro
+    tabelas = page.extract_tables()
+    if tabelas:
+        for tabela in tabelas:
+            if not tabela or len(tabela) < 2:
+                continue
 
-        # Verificar se alguma célula da linha contém "P300"
-        celula_p300 = False
-        for celula in linha:
-            if celula and PADRAO_CELULA_P300.match(str(celula).strip()):
-                celula_p300 = True
-                break
+            cabecalho = tabela[0]
+            idx_verba = _encontrar_indice_coluna(
+                cabecalho, 'verba', 'rubrica', 'código', 'codigo', 'cod',
+            )
+            idx_valor = _encontrar_indice_coluna(
+                cabecalho, 'valor', 'vencimento', 'provento', 'total',
+            )
+            idx_competencia = _encontrar_indice_coluna(
+                cabecalho, 'competência', 'competencia', 'compet',
+            )
+            idx_desc = _encontrar_indice_coluna(
+                cabecalho, 'descrição', 'descricao', 'denominação',
+                'denominacao', 'nome',
+            )
 
-        if not celula_p300:
-            # Também verificar se a descrição contém P300
-            if idx_desc is not None and idx_desc < len(linha) and linha[idx_desc]:
-                if re.search(r'\bP\s*\.?\s*300\b', str(linha[idx_desc]), re.IGNORECASE):
-                    celula_p300 = True
+            for linha in tabela[1:]:
+                if not linha:
+                    continue
 
-        if not celula_p300:
-            continue
-
-        # Encontrar o valor: usar coluna identificada ou buscar na linha
-        valor = None
-        if idx_valor is not None and idx_valor < len(linha):
-            valor = _parse_valor_br(str(linha[idx_valor] or ''))
-
-        # Se não encontrou pela coluna de valor, procurar o último valor
-        # monetário na linha (geralmente o valor fica nas últimas colunas)
-        if valor is None:
-            for celula in reversed(linha):
-                if celula:
-                    v = _parse_valor_br(str(celula))
-                    if v is not None and v > 0:
-                        valor = v
+                # Verificar se alguma célula contém "P300"
+                tem_p300 = False
+                for celula in linha:
+                    if celula and re.match(
+                        r'^P\s*\.?\s*300$', str(celula).strip(), re.IGNORECASE,
+                    ):
+                        tem_p300 = True
                         break
+                if not tem_p300 and idx_desc is not None and idx_desc < len(linha):
+                    if linha[idx_desc] and re.search(
+                        r'\bP\s*\.?\s*300\b', str(linha[idx_desc]), re.IGNORECASE,
+                    ):
+                        tem_p300 = True
+                if not tem_p300:
+                    continue
 
-        if valor is None or valor <= 0:
-            continue
+                # Extrair valor
+                valor = None
+                if idx_valor is not None and idx_valor < len(linha):
+                    valor = _parse_valor_br(str(linha[idx_valor] or ''))
+                if valor is None:
+                    for celula in reversed(linha):
+                        if celula:
+                            v = _parse_valor_br(str(celula))
+                            if v is not None:
+                                valor = v
+                                break
+                if valor is None:
+                    continue
 
-        resultados.append((data_pdf, valor))
+                # Extrair competência da linha
+                competencia = None
+                if idx_competencia is not None and idx_competencia < len(linha):
+                    cel_comp = str(linha[idx_competencia] or '').strip()
+                    m = PADRAO_COMPETENCIA_CELULA.search(cel_comp)
+                    if m:
+                        raw = m.group(1)
+                        parts = raw.split('/')
+                        competencia = f"{int(parts[0]):02d}/{parts[1]}"
+
+                resultados.append({
+                    'contracheque': mes_ano_pagina or 'N/D',
+                    'competencia': competencia or mes_ano_pagina or 'N/D',
+                    'valor': valor,
+                })
+
+    # Fallback: texto linha a linha (PDFs sem tabela detectável)
+    if not tabelas:
+        texto = page.extract_text() or ""
+        for texto_linha in texto.split('\n'):
+            if not re.search(r'\bP\s*\.?\s*300\b', texto_linha, re.IGNORECASE):
+                continue
+            # Extrair valores monetários (incluindo negativo com - no final)
+            valores_raw = re.findall(
+                r'(\d{1,3}(?:\.\d{3})*,\d{2}\s*-?)', texto_linha,
+            )
+            if not valores_raw:
+                continue
+            # O último valor monetário da linha costuma ser o total
+            valor = _parse_valor_br(valores_raw[-1])
+            if valor is None:
+                continue
+            # Tentar pegar competência na mesma linha
+            competencia = None
+            m = PADRAO_COMPETENCIA_CELULA.search(texto_linha)
+            if m:
+                raw = m.group(1)
+                parts = raw.split('/')
+                competencia = f"{int(parts[0]):02d}/{parts[1]}"
+
+            resultados.append({
+                'contracheque': mes_ano_pagina or 'N/D',
+                'competencia': competencia or mes_ano_pagina or 'N/D',
+                'valor': valor,
+            })
 
     return resultados
 
 
-def extrair_p300_contracheque(caminho_pdf: str) -> list[tuple[datetime | None, float]]:
+def extrair_p300_pdf(caminho_pdf: str) -> list[dict]:
     """
-    Extrai todas as ocorrências da verba P300 de um PDF de contracheque.
-    Usa extração por tabelas para ler os dados estruturadamente.
-    Retorna lista de (data, valor).
+    Extrai todas as ocorrências da verba P300 de um PDF.
+    Processa cada página independentemente (cada página = um contracheque).
+    Retorna lista de dicts: {contracheque, competencia, valor, arquivo}
+    Todas as datas são strings MM/AAAA — sem conversão para datetime.
     """
-    data_pdf = extrair_data_contracheque(caminho_pdf)
-
     try:
         with pdfplumber.open(caminho_pdf) as pdf:
             if not pdf.pages:
                 return []
 
             resultados = []
-            for page in pdf.pages:
-                tabelas = page.extract_tables()
-                if tabelas:
-                    for tabela in tabelas:
-                        resultados.extend(_extrair_p300_da_tabela(tabela, data_pdf))
+            nome_arquivo = os.path.basename(caminho_pdf)
 
-                # Fallback: se nenhuma tabela foi detectada, tentar via texto
-                # linha a linha (para PDFs sem estrutura tabular detectável)
-                if not tabelas:
-                    texto = page.extract_text() or ""
-                    for texto_linha in texto.split('\n'):
-                        if not re.search(r'\bP\s*\.?\s*300\b', texto_linha, re.IGNORECASE):
-                            continue
-                        # Extrair todos os valores monetários da linha
-                        valores = re.findall(
-                            r'(\d{1,3}(?:\.\d{3})*,\d{2})', texto_linha
-                        )
-                        if valores:
-                            # O último valor monetário da linha costuma ser o total
-                            valor_str = valores[-1].replace('.', '').replace(',', '.')
-                            try:
-                                valor = float(valor_str)
-                                if valor > 0:
-                                    resultados.append((data_pdf, valor))
-                            except ValueError:
-                                continue
+            for page in pdf.pages:
+                texto = page.extract_text() or ""
+                mes_ano = _extrair_mes_ano_pagina(texto)
+
+                ocorrencias = _extrair_p300_pagina(page, mes_ano)
+                for oc in ocorrencias:
+                    oc['arquivo'] = nome_arquivo
+                resultados.extend(ocorrencias)
 
             return resultados
     except Exception:
@@ -345,10 +427,21 @@ def organizar_contracheques(pasta_entrada: str, callback_log=None):
     return True, arquivo_saida
 
 
+def _chave_ordenacao_mes_ano(texto: str) -> tuple[int, int]:
+    """Converte 'MM/AAAA' em (AAAA, MM) para ordenação cronológica."""
+    try:
+        parts = texto.split('/')
+        return (int(parts[1]), int(parts[0]))
+    except (ValueError, IndexError):
+        return (9999, 99)
+
+
 def gerar_planilha_p300(pasta_entrada: str, callback_log=None):
     """
     Lê todos os PDFs da pasta, extrai ocorrências da verba P300
-    e gera uma planilha .xlsx com a evolução mês a mês.
+    e gera uma planilha .xlsx com uma linha por ocorrência.
+
+    Colunas: Contracheque | Competência | Valor (R$) | Observação
 
     Retorna (sucesso: bool, mensagem: str).
     """
@@ -362,30 +455,33 @@ def gerar_planilha_p300(pasta_entrada: str, callback_log=None):
     if not os.path.isdir(pasta_entrada):
         return False, f"Pasta '{pasta_entrada}' não encontrada."
 
-    arquivos_pdf = [
+    arquivos_pdf = sorted([
         os.path.join(pasta_entrada, f)
         for f in os.listdir(pasta_entrada)
         if f.lower().endswith('.pdf')
-    ]
+    ])
 
     if not arquivos_pdf:
         return False, "Nenhum arquivo PDF encontrado na pasta selecionada."
 
     log(f"Encontrados {len(arquivos_pdf)} arquivo(s) PDF.\n")
 
-    todas_ocorrencias = []
+    todas_ocorrencias: list[dict] = []
     arquivos_sem_p300 = 0
 
     for caminho in arquivos_pdf:
         nome = os.path.basename(caminho)
-        ocorrencias = extrair_p300_contracheque(caminho)
+        ocorrencias = extrair_p300_pdf(caminho)
         if ocorrencias:
-            for data, valor in ocorrencias:
-                todas_ocorrencias.append((data, valor, nome))
-                if data:
-                    log(f"  P300  {nome}  ->  {data.strftime('%m/%Y')}  R$ {valor:,.2f}")
-                else:
-                    log(f"  P300  {nome}  ->  Data não identificada  R$ {valor:,.2f}")
+            todas_ocorrencias.extend(ocorrencias)
+            for oc in ocorrencias:
+                sinal = " (Estorno)" if oc['valor'] < 0 else ""
+                log(
+                    f"  P300  {nome}  ->  "
+                    f"Folha {oc['contracheque']}  "
+                    f"Comp {oc['competencia']}  "
+                    f"R$ {oc['valor']:,.2f}{sinal}"
+                )
         else:
             arquivos_sem_p300 += 1
             log(f"  ---   {nome}  ->  Sem verba P300")
@@ -393,91 +489,112 @@ def gerar_planilha_p300(pasta_entrada: str, callback_log=None):
     if not todas_ocorrencias:
         return False, "Nenhuma ocorrência de P300 encontrada nos contracheques."
 
-    # Separar com e sem data
-    com_data = [(d, v, n) for d, v, n in todas_ocorrencias if d is not None]
-    sem_data = [(d, v, n) for d, v, n in todas_ocorrencias if d is None]
+    # Ordenar por contracheque (cronológico) mantendo ordem de aparição dentro
+    # da mesma folha
+    todas_ocorrencias.sort(key=lambda oc: _chave_ordenacao_mes_ano(oc['contracheque']))
 
-    # Ordenar cronologicamente
-    com_data.sort(key=lambda x: x[0])
-
-    linhas = com_data + sem_data
-
-    # Tentar extrair nome do cliente a partir do nome da pasta
+    # Nome do cliente a partir do nome da pasta
     nome_pasta = os.path.basename(pasta_entrada.rstrip(os.sep))
     nome_cliente = re.sub(r'[\\/*?:"<>|]', '_', nome_pasta)
 
-    # Criar planilha
+    # --- Criar planilha ---
     wb = Workbook()
     ws = wb.active
-    ws.title = "Evolução P300"
+    ws.title = "Ocorrências P300"
 
     # Estilos
-    header_font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="003E63", end_color="003E63", fill_type="solid")
-    header_alignment = Alignment(horizontal="center", vertical="center")
-    thin_border = Border(
-        left=Side(style="thin", color="C8D0D8"),
-        right=Side(style="thin", color="C8D0D8"),
-        top=Side(style="thin", color="C8D0D8"),
-        bottom=Side(style="thin", color="C8D0D8"),
+    borda = Border(
+        left=Side(style="thin", color="CCCCCC"),
+        right=Side(style="thin", color="CCCCCC"),
+        top=Side(style="thin", color="CCCCCC"),
+        bottom=Side(style="thin", color="CCCCCC"),
     )
-    valor_font = Font(name="Calibri", size=11)
-    valor_alignment = Alignment(horizontal="center", vertical="center")
+    header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="003E63", end_color="003E63", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center")
+
+    data_font = Font(name="Arial", size=10)
+    align_center = Alignment(horizontal="center", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+    align_left = Alignment(horizontal="left", vertical="center")
+
+    fill_branco = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    fill_azul = PatternFill(start_color="EBF3FB", end_color="EBF3FB", fill_type="solid")
+    fill_estorno = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
     # Cabeçalho
-    colunas = ["Mês/Ano", "Competência", "Valor P300"]
+    colunas = ["Contracheque", "Competência", "Valor (R$)", "Observação"]
+    ws.row_dimensions[1].height = 22
     for col_idx, titulo in enumerate(colunas, 1):
         cell = ws.cell(row=1, column=col_idx, value=titulo)
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = header_alignment
-        cell.border = thin_border
+        cell.alignment = header_align
+        cell.border = borda
 
     # Dados
-    for row_idx, (data, valor, _nome) in enumerate(linhas, 2):
-        if data:
-            mes_ano = data.strftime("%m/%Y")
-            competencia = data.strftime("%B/%Y").capitalize()
+    for row_idx, oc in enumerate(todas_ocorrencias, 2):
+        is_estorno = oc['valor'] < 0
+        observacao = "Estorno" if is_estorno else ""
+
+        # Determinar preenchimento de fundo
+        if is_estorno:
+            fill = fill_estorno
+        elif (row_idx % 2) == 0:
+            fill = fill_branco
         else:
-            mes_ano = "N/D"
-            competencia = "Não identificada"
+            fill = fill_azul
 
-        cell_mes = ws.cell(row=row_idx, column=1, value=mes_ano)
-        cell_mes.alignment = valor_alignment
-        cell_mes.border = thin_border
-        cell_mes.font = valor_font
+        # Coluna A: Contracheque (MM/AAAA)
+        cell = ws.cell(row=row_idx, column=1, value=oc['contracheque'])
+        cell.font = data_font
+        cell.alignment = align_center
+        cell.border = borda
+        cell.fill = fill
 
-        cell_comp = ws.cell(row=row_idx, column=2, value=competencia)
-        cell_comp.alignment = valor_alignment
-        cell_comp.border = thin_border
-        cell_comp.font = valor_font
+        # Coluna B: Competência (MM/AAAA)
+        cell = ws.cell(row=row_idx, column=2, value=oc['competencia'])
+        cell.font = data_font
+        cell.alignment = align_center
+        cell.border = borda
+        cell.fill = fill
 
-        cell_valor = ws.cell(row=row_idx, column=3, value=valor)
-        cell_valor.number_format = '#,##0.00'
-        cell_valor.alignment = valor_alignment
-        cell_valor.border = thin_border
-        cell_valor.font = valor_font
+        # Coluna C: Valor (R$)
+        cell = ws.cell(row=row_idx, column=3, value=oc['valor'])
+        cell.number_format = '#,##0.00'
+        cell.font = data_font
+        cell.alignment = align_right
+        cell.border = borda
+        cell.fill = fill
 
-    # Ajustar largura das colunas
-    ws.column_dimensions['A'].width = 14
-    ws.column_dimensions['B'].width = 22
+        # Coluna D: Observação
+        cell = ws.cell(row=row_idx, column=4, value=observacao)
+        cell.font = data_font
+        cell.alignment = align_left
+        cell.border = borda
+        cell.fill = fill
+
+    # Larguras de coluna
+    ws.column_dimensions['A'].width = 18
+    ws.column_dimensions['B'].width = 18
     ws.column_dimensions['C'].width = 18
+    ws.column_dimensions['D'].width = 20
 
-    nome_arquivo = f"evolucao_P300_{nome_cliente}.xlsx"
+    # Cabeçalho fixo
+    ws.freeze_panes = "A2"
+
+    nome_arquivo = f"P300_{nome_cliente}.xlsx"
     caminho_saida = os.path.join(pasta_entrada, nome_arquivo)
     wb.save(caminho_saida)
 
+    total_estornos = sum(1 for oc in todas_ocorrencias if oc['valor'] < 0)
     resumo = (
         f"\nPlanilha P300 gerada com sucesso!\n"
         f"  Arquivo: {nome_arquivo}\n"
         f"  Ocorrências de P300: {len(todas_ocorrencias)}\n"
+        f"  Estornos: {total_estornos}\n"
         f"  Arquivos sem P300: {arquivos_sem_p300}"
     )
-    if com_data:
-        resumo += (
-            f"\n  Período: {com_data[0][0].strftime('%m/%Y')} "
-            f"a {com_data[-1][0].strftime('%m/%Y')}"
-        )
 
     log(resumo)
     return True, caminho_saida
