@@ -63,11 +63,37 @@ PADRAO_COMPETENCIA = re.compile(
     re.IGNORECASE,
 )
 
-# Padrão para capturar a verba P300 e seu valor
-PADRAO_P300 = re.compile(
-    r'P\s*300\b.*?(\d[\d.,]*)',
-    re.IGNORECASE,
-)
+# Padrão para identificar célula que contém a verba P300
+PADRAO_CELULA_P300 = re.compile(r'^P\s*\.?\s*300$', re.IGNORECASE)
+
+# Padrão para identificar valores monetários (ex: 1.234,56 ou 1234,56 ou 1234.56)
+PADRAO_VALOR_MONETARIO = re.compile(r'^-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})$')
+
+# Padrão para datas em células de tabela (MM/AAAA ou MM.AAAA ou MM-AAAA)
+PADRAO_DATA_CELULA = re.compile(r'(\d{1,2})\s*[/.\-]\s*(2\d{3})')
+
+
+def _parse_valor_br(texto: str) -> float | None:
+    """Converte valor monetário brasileiro (1.234,56) para float."""
+    if not texto:
+        return None
+    texto = texto.strip().lstrip('-').strip()
+    match = PADRAO_VALOR_MONETARIO.match(texto.strip())
+    if match:
+        valor_str = match.group(1).replace('.', '').replace(',', '.')
+        try:
+            return float(valor_str)
+        except ValueError:
+            return None
+    # Fallback: tentar interpretar diretamente se for algo simples como "1234,56"
+    texto_limpo = texto.strip().replace('.', '').replace(',', '.')
+    try:
+        val = float(texto_limpo)
+        if val > 0:
+            return val
+    except ValueError:
+        pass
+    return None
 
 
 def extrair_data_contracheque(caminho_pdf: str) -> datetime | None:
@@ -102,33 +128,126 @@ def extrair_data_contracheque(caminho_pdf: str) -> datetime | None:
     return None
 
 
+def _encontrar_indice_coluna(cabecalho: list[str | None], *nomes) -> int | None:
+    """Encontra o índice de uma coluna pelo nome (case-insensitive, parcial)."""
+    if not cabecalho:
+        return None
+    for idx, celula in enumerate(cabecalho):
+        if not celula:
+            continue
+        celula_lower = celula.strip().lower()
+        for nome in nomes:
+            if nome.lower() in celula_lower:
+                return idx
+    return None
+
+
+def _extrair_p300_da_tabela(tabela: list[list], data_pdf: datetime | None):
+    """
+    Dada uma tabela extraída do PDF (lista de linhas, cada linha é lista de
+    células), encontra as linhas com verba P300 e extrai data + valor.
+    Retorna lista de (datetime | None, float).
+    """
+    if not tabela or len(tabela) < 2:
+        return []
+
+    # Tentar identificar cabeçalho (primeira linha)
+    cabecalho = tabela[0]
+
+    # Procurar colunas relevantes
+    idx_verba = _encontrar_indice_coluna(cabecalho, 'verba', 'rubrica', 'código', 'codigo', 'cod')
+    idx_valor = _encontrar_indice_coluna(cabecalho, 'valor', 'vencimento', 'provento', 'total')
+    idx_desc = _encontrar_indice_coluna(cabecalho, 'descrição', 'descricao', 'denominação', 'denominacao', 'nome')
+
+    resultados = []
+
+    for linha in tabela[1:]:
+        if not linha:
+            continue
+
+        # Verificar se alguma célula da linha contém "P300"
+        celula_p300 = False
+        for celula in linha:
+            if celula and PADRAO_CELULA_P300.match(str(celula).strip()):
+                celula_p300 = True
+                break
+
+        if not celula_p300:
+            # Também verificar se a descrição contém P300
+            if idx_desc is not None and idx_desc < len(linha) and linha[idx_desc]:
+                if re.search(r'\bP\s*\.?\s*300\b', str(linha[idx_desc]), re.IGNORECASE):
+                    celula_p300 = True
+
+        if not celula_p300:
+            continue
+
+        # Encontrar o valor: usar coluna identificada ou buscar na linha
+        valor = None
+        if idx_valor is not None and idx_valor < len(linha):
+            valor = _parse_valor_br(str(linha[idx_valor] or ''))
+
+        # Se não encontrou pela coluna de valor, procurar o último valor
+        # monetário na linha (geralmente o valor fica nas últimas colunas)
+        if valor is None:
+            for celula in reversed(linha):
+                if celula:
+                    v = _parse_valor_br(str(celula))
+                    if v is not None and v > 0:
+                        valor = v
+                        break
+
+        if valor is None or valor <= 0:
+            continue
+
+        resultados.append((data_pdf, valor))
+
+    return resultados
+
+
 def extrair_p300_contracheque(caminho_pdf: str) -> list[tuple[datetime | None, float]]:
     """
     Extrai todas as ocorrências da verba P300 de um PDF de contracheque.
+    Usa extração por tabelas para ler os dados estruturadamente.
     Retorna lista de (data, valor).
     """
+    data_pdf = extrair_data_contracheque(caminho_pdf)
+
     try:
         with pdfplumber.open(caminho_pdf) as pdf:
             if not pdf.pages:
                 return []
-            texto = ""
+
+            resultados = []
             for page in pdf.pages:
-                texto += (page.extract_text() or "") + "\n"
+                tabelas = page.extract_tables()
+                if tabelas:
+                    for tabela in tabelas:
+                        resultados.extend(_extrair_p300_da_tabela(tabela, data_pdf))
+
+                # Fallback: se nenhuma tabela foi detectada, tentar via texto
+                # linha a linha (para PDFs sem estrutura tabular detectável)
+                if not tabelas:
+                    texto = page.extract_text() or ""
+                    for texto_linha in texto.split('\n'):
+                        if not re.search(r'\bP\s*\.?\s*300\b', texto_linha, re.IGNORECASE):
+                            continue
+                        # Extrair todos os valores monetários da linha
+                        valores = re.findall(
+                            r'(\d{1,3}(?:\.\d{3})*,\d{2})', texto_linha
+                        )
+                        if valores:
+                            # O último valor monetário da linha costuma ser o total
+                            valor_str = valores[-1].replace('.', '').replace(',', '.')
+                            try:
+                                valor = float(valor_str)
+                                if valor > 0:
+                                    resultados.append((data_pdf, valor))
+                            except ValueError:
+                                continue
+
+            return resultados
     except Exception:
         return []
-
-    data = extrair_data_contracheque(caminho_pdf)
-
-    resultados = []
-    for match in PADRAO_P300.finditer(texto):
-        valor_str = match.group(1).replace('.', '').replace(',', '.')
-        try:
-            valor = float(valor_str)
-            resultados.append((data, valor))
-        except ValueError:
-            continue
-
-    return resultados
 
 
 def organizar_contracheques(pasta_entrada: str, callback_log=None):
